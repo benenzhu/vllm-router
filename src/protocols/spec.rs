@@ -560,7 +560,9 @@ impl GenerationRequest for ChatCompletionRequest {
         };
         for msg in &self.messages {
             match msg {
-                ChatMessage::System { content, .. } | ChatMessage::Function { content, .. } => push(content),
+                ChatMessage::System { content, .. } | ChatMessage::Function { content, .. } => {
+                    push(content)
+                }
                 ChatMessage::User { content, .. } => match content {
                     UserMessageContent::Text(text) => push(text),
                     UserMessageContent::Parts(parts) => {
