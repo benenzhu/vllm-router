@@ -547,8 +547,55 @@ impl GenerationRequest for ChatCompletionRequest {
             }
         }
 
-        // Return empty string if no session_id - let routing policy handle this case
-        String::new()
+        // Otherwise route on the conversation text, so prefix-aware policies (cache_aware) see that a turn
+        // extends an earlier prompt. Message text in order, as SGLang's model gateway does.
+        let mut buffer = String::new();
+        let mut push = |text: &str| {
+            if !text.is_empty() {
+                if !buffer.is_empty() {
+                    buffer.push('\n');
+                }
+                buffer.push_str(text);
+            }
+        };
+        for msg in &self.messages {
+            match msg {
+                ChatMessage::System { content, .. } | ChatMessage::Function { content, .. } => push(content),
+                ChatMessage::User { content, .. } => match content {
+                    UserMessageContent::Text(text) => push(text),
+                    UserMessageContent::Parts(parts) => {
+                        for part in parts {
+                            if let ContentPart::Text { text } = part {
+                                push(text);
+                            }
+                        }
+                    }
+                },
+                ChatMessage::Assistant {
+                    content,
+                    reasoning,
+                    tool_calls,
+                    ..
+                } => {
+                    if let Some(text) = reasoning {
+                        push(text);
+                    }
+                    if let Some(text) = content {
+                        push(text);
+                    }
+                    if let Some(calls) = tool_calls {
+                        if let Ok(text) = serde_json::to_string(calls) {
+                            push(&text);
+                        }
+                    }
+                }
+                ChatMessage::Tool { content, .. } => match content.as_str() {
+                    Some(text) => push(text),
+                    None => push(&content.to_string()),
+                },
+            }
+        }
+        buffer
     }
 }
 
