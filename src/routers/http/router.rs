@@ -5,7 +5,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, LoadGuard, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -503,12 +503,25 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    #[cfg(test)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_tracked(model_id, text, headers)
+            .map(|(worker, _)| worker)
+    }
+
+    /// Select worker for a specific model considering circuit breaker state; a load-tracking
+    /// policy also returns the guard that holds this request's charge on the worker
+    fn select_worker_for_model_tracked(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<(Arc<dyn Worker>, Option<LoadGuard>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -533,8 +546,9 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, load_guard) =
+            policy.select_worker_tracked(&available, text, request_headers.as_ref())?;
+        Some((available[idx].clone(), load_guard))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -552,17 +566,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
+                let (worker, load_guard) =
+                    match self.select_worker_for_model_tracked(model_id, Some(&text), headers) {
+                        Some(w) => w,
+                        None => {
+                            RouterMetrics::record_request_error(route, "no_available_workers");
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "No available workers (all circuits open or unhealthy)",
+                            )
+                                .into_response();
+                        }
+                    };
 
                 // Optional load tracking for cache-aware policy
                 // Get the policy for this model to check if it's cache-aware
@@ -594,6 +609,7 @@ impl Router {
                         worker.url(),
                         is_stream,
                         load_incremented,
+                        load_guard,
                     )
                     .await;
 
@@ -764,6 +780,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -772,6 +789,9 @@ impl Router {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
+        // The policy's charge for this request: released by the first response chunk and on drop
+        // (non-streaming: when the body is read; streaming: when the stream ends or is cancelled)
+        load_guard: Option<LoadGuard>,
     ) -> Response {
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
@@ -921,6 +941,7 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut load_guard = load_guard;
 
             // Spawn task to forward stream and detect completion
             tokio::spawn(async move {
@@ -929,6 +950,11 @@ impl Router {
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if let Some(guard) = load_guard.as_mut() {
+                                if !bytes.is_empty() {
+                                    guard.prefill_done();
+                                }
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -975,13 +1001,19 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut load_guard = load_guard;
 
-            // Spawn task to forward stream
+            // Spawn task to forward stream; dropping the load guard at its end releases the charge
             tokio::spawn(async move {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
+                            if let Some(guard) = load_guard.as_mut() {
+                                if !bytes.is_empty() {
+                                    guard.prefill_done();
+                                }
+                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }

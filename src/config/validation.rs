@@ -242,6 +242,17 @@ impl ConfigValidator {
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
             }
+            PolicyConfig::SessionLeastLoad {
+                session_ttl_secs, ..
+            } => {
+                if *session_ttl_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "session_ttl_secs".to_string(),
+                        value: session_ttl_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
