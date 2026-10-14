@@ -6,7 +6,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, LoadGuard, PolicyRegistry};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -139,6 +139,9 @@ struct TypedDispatch<'a> {
     is_stream: bool,
     load_incremented: bool,
     prepared: Option<crate::backend::PreparedChat>,
+    // The policy's charge for this request: released by the first response chunk and on drop
+    // (non-streaming: when the body is read; streaming: when the stream ends or is cancelled)
+    load_guard: Option<LoadGuard>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -1005,12 +1008,25 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    #[cfg(test)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_tracked(model_id, text, headers)
+            .map(|(worker, _)| worker)
+    }
+
+    /// Select worker for a specific model considering circuit breaker state; a load-tracking
+    /// policy also returns the guard that holds this request's charge on the worker
+    fn select_worker_for_model_tracked(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<(Arc<dyn Worker>, Option<LoadGuard>)> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1035,8 +1051,22 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
-        Some(available[idx].clone())
+        let (idx, load_guard) =
+            policy.select_worker_tracked(&available, text, request_headers.as_ref())?;
+        Some((available[idx].clone(), load_guard))
+    }
+
+    /// Text a policy routes a typed request on: a policy that estimates prompt size
+    /// (session_least_load) opts in to the conversation text Program scheduling uses.
+    fn text_for_policy<T: GenerationRequest>(
+        policy: &dyn LoadBalancingPolicy,
+        typed_req: &T,
+    ) -> String {
+        if policy.needs_prompt_text() {
+            typed_req.extract_text_for_program_scheduling()
+        } else {
+            typed_req.extract_text_for_routing()
+        }
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -1092,7 +1122,11 @@ impl Router {
             None
         };
 
-        let text = typed_req.extract_text_for_routing();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let text = Self::text_for_policy(policy.as_ref(), typed_req);
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -1119,11 +1153,11 @@ impl Router {
                     let Some(worker) = worker else {
                         return Self::program_target_unavailable_response(route);
                     };
-                    Some(worker)
+                    Some((worker, None))
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model_tracked(model_id, Some(&text), headers)
                 };
-                let worker = match selected_worker {
+                let (worker, load_guard) = match selected_worker {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -1136,12 +1170,6 @@ impl Router {
                 };
 
                 // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
                 let load_incremented =
                     if policy.name() == "cache_aware" || program_completion.is_some() {
                         worker.increment_load();
@@ -1168,6 +1196,7 @@ impl Router {
                             is_stream,
                             load_incremented,
                             prepared: prepared.clone(),
+                            load_guard,
                         },
                         program_completion.clone(),
                     )
@@ -1358,6 +1387,7 @@ impl Router {
             is_stream,
             load_incremented,
             prepared,
+            mut load_guard,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
             // gRPC workers are chat-only in this milestone. Reject unsupported
@@ -1593,6 +1623,11 @@ impl Router {
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
+                            if let Some(guard) = load_guard.as_mut() {
+                                if !bytes.is_empty() {
+                                    guard.prefill_done();
+                                }
+                            }
                             // Check for stream end marker
                             if bytes
                                 .as_ref()
@@ -1672,6 +1707,11 @@ impl Router {
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
+                            }
+                            if let Some(guard) = load_guard.as_mut() {
+                                if !bytes.is_empty() {
+                                    guard.prefill_done();
+                                }
                             }
                             if tx.send(Ok(bytes)).is_err() {
                                 stream_succeeded = false;
@@ -3311,6 +3351,30 @@ mod tests {
             worker_urls_seen.len() >= 2,
             "Expected distribution across workers, only used: {:?}",
             worker_urls_seen
+        );
+    }
+
+    #[test]
+    fn test_text_for_policy_gives_prompt_text_only_to_opted_in_policy() {
+        use crate::policies::{CacheAwarePolicy, SessionLeastLoadPolicy};
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "shared prefix"},
+                {"role": "user", "content": "next turn"}
+            ],
+            "session_params": {"session_id": "stable-session"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            Router::text_for_policy(&SessionLeastLoadPolicy::new(), &request),
+            request.extract_text_for_program_scheduling()
+        );
+        assert_eq!(
+            Router::text_for_policy(&CacheAwarePolicy::new(), &request),
+            "stable-session"
         );
     }
 
