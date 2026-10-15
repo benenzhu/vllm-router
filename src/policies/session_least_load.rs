@@ -10,7 +10,8 @@
 //!   the least-loaded worker, ties broken by a rendezvous hash of (session, worker).
 //! - A known session always goes to its owner; load never moves it. Only an owner that left the
 //!   healthy set makes the session be placed again.
-//! - A sub-agent with its own id is a session of its own, placed by load.
+//! - A sub-agent with its own id is a session of its own, placed by load. A session id used with
+//!   several models is a session per model.
 //! - A request without a session id goes to the least-loaded worker (rotating start on ties).
 //!
 //! The router does not tokenize: a prompt counts `len(request text) / 4` tokens. The policy asks
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
-use super::get_healthy_worker_indices;
+use super::{get_healthy_worker_indices, normalize_model_key};
 use super::{LoadBalancingPolicy, LoadGuard, RequestHeaders, RequestLoadGuard};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
@@ -82,11 +83,14 @@ struct Counters {
     no_session: u64,
 }
 
+/// (model, session id): a session id used with several models is one session per model
+type SessionKey = (String, String);
+
 #[derive(Debug)]
 struct State {
     /// Keyed by worker URL (`http://host:port@rank` for DP-aware workers)
     loads: HashMap<String, WorkerLoad>,
-    sessions: HashMap<String, Session>,
+    sessions: HashMap<SessionKey, Session>,
     counters: Counters,
     cursor: usize,
     last_prune: Instant,
@@ -257,6 +261,12 @@ impl SessionLeastLoadPolicy {
             return None;
         }
         let session = session_id(headers);
+        // Sessions are kept per model: one policy instance can serve several models (the
+        // registry hands its default policy to every model without a policy of its own).
+        let key = session.map(|sid| {
+            let model = normalize_model_key(workers[healthy[0]].model_id());
+            (model.to_string(), sid.to_string())
+        });
         let prompt_tokens = estimate_prompt_tokens(request_text);
         let req_equiv = self.config.req_equiv;
         let now = Instant::now();
@@ -266,14 +276,14 @@ impl SessionLeastLoadPolicy {
         // the state this decision sees, before its own charge
         st.log_stats(now, workers);
 
-        let (idx, tokens, decision) = match session {
+        let (idx, tokens, decision) = match &key {
             None => {
                 st.counters.no_session += 1;
                 let idx = st.least_loaded(workers, &healthy, None, req_equiv);
                 (idx, prompt_tokens, "no_session")
             }
-            Some(sid) => {
-                let owner = st.sessions.get(sid).map(|s| {
+            Some(key) => {
+                let owner = st.sessions.get(key).map(|s| {
                     let idx = healthy
                         .iter()
                         .copied()
@@ -283,7 +293,7 @@ impl SessionLeastLoadPolicy {
                 match owner {
                     Some((Some(idx), previous)) => {
                         st.counters.owner_hits += 1;
-                        if let Some(s) = st.sessions.get_mut(sid) {
+                        if let Some(s) = st.sessions.get_mut(key) {
                             // A tracked request records its prompt once it is prefilled.
                             if !charge {
                                 s.prompt_tokens = prompt_tokens;
@@ -301,9 +311,9 @@ impl SessionLeastLoadPolicy {
                             st.counters.new_sessions += 1;
                             "new"
                         };
-                        let idx = st.least_loaded(workers, &healthy, Some(sid), req_equiv);
+                        let idx = st.least_loaded(workers, &healthy, Some(&key.1), req_equiv);
                         st.sessions.insert(
-                            sid.to_string(),
+                            key.clone(),
                             Session {
                                 owner: workers[idx].url().to_string(),
                                 prompt_tokens: if charge { 0 } else { prompt_tokens },
@@ -327,7 +337,7 @@ impl SessionLeastLoadPolicy {
                 state: Arc::clone(&self.state),
                 worker_url: url.to_string(),
                 tokens,
-                session_prompt: session.map(|sid| (sid.to_string(), prompt_tokens)),
+                session_prompt: key.map(|key| (key, prompt_tokens)),
             }) as LoadGuard)
         } else {
             None
@@ -409,8 +419,8 @@ struct SessionLoadGuard {
     state: Arc<Mutex<State>>,
     worker_url: String,
     tokens: u64,
-    /// (session, prompt tokens) to record on the session once the prompt is prefilled
-    session_prompt: Option<(String, u64)>,
+    /// (session key, prompt tokens) to record on the session once the prompt is prefilled
+    session_prompt: Option<(SessionKey, u64)>,
 }
 
 impl RequestLoadGuard for SessionLoadGuard {
@@ -424,8 +434,8 @@ impl RequestLoadGuard for SessionLoadGuard {
         }
         self.tokens = 0;
         // The owner now caches this prompt: the session's next turn is charged only its growth.
-        if let Some((sid, prompt_tokens)) = self.session_prompt.take() {
-            if let Some(s) = st.sessions.get_mut(&sid) {
+        if let Some((key, prompt_tokens)) = self.session_prompt.take() {
+            if let Some(s) = st.sessions.get_mut(&key) {
                 if s.owner == self.worker_url {
                     s.prompt_tokens = prompt_tokens;
                 }
@@ -448,7 +458,7 @@ impl Drop for SessionLoadGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{DPAwareWorker, WorkerType};
+    use crate::core::{BasicWorker, DPAwareWorker, WorkerType};
 
     fn dp_workers(n: usize) -> Vec<Arc<dyn Worker>> {
         (0..n)
@@ -626,6 +636,42 @@ mod tests {
         assert_eq!(loads(&p, &workers)[idx], (1, 100));
     }
 
+    fn model_workers(model: &str, n: usize) -> Vec<Arc<dyn Worker>> {
+        (0..n)
+            .map(|i| {
+                let labels = HashMap::from([("model_id".to_string(), model.to_string())]);
+                Arc::new(
+                    BasicWorker::new(format!("http://{}-{}:8000", model, i), WorkerType::Regular)
+                        .with_labels(labels),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_session_scoped_per_model() {
+        let a = model_workers("model-a", 2);
+        let b = model_workers("model-b", 2);
+        let p = policy(512);
+        // One session id used with two models: each model keeps its own owner and prompt.
+        let (owner_a, mut g) = route(&p, &a, Some("s"), 1000);
+        g.prefill_done();
+        drop(g);
+        let (owner_b, mut g) = route(&p, &b, Some("s"), 2000);
+        g.prefill_done();
+        drop(g);
+        let (idx, g) = route(&p, &a, Some("s"), 1100);
+        assert_eq!(idx, owner_a);
+        assert_eq!(loads(&p, &a)[owner_a], (1, 100));
+        drop(g);
+        let (idx, _g) = route(&p, &b, Some("s"), 2200);
+        assert_eq!(idx, owner_b);
+        assert_eq!(loads(&p, &b)[owner_b], (1, 200));
+        let st = p.state.lock();
+        assert_eq!(st.counters.owner_lost, 0);
+        assert_eq!(st.sessions.len(), 2);
+    }
+
     #[test]
     fn test_release_on_first_chunk_then_finish() {
         let workers = dp_workers(2);
@@ -734,7 +780,7 @@ mod tests {
         }
         let (_, _g) = route(&p, &workers, Some("t"), 10);
         let st = p.state.lock();
-        assert!(!st.sessions.contains_key("s"));
+        assert!(!st.sessions.keys().any(|(_, sid)| sid == "s"));
         assert_eq!(st.counters.new_sessions, 2);
     }
 
