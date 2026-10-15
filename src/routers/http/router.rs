@@ -74,6 +74,7 @@ struct LoadTrackedBody {
     >,
     worker: Option<Arc<dyn Worker>>,
     producer_abort: Option<tokio::task::AbortHandle>,
+    load_guard: Option<LoadGuard>,
 }
 
 impl LoadTrackedBody {
@@ -82,6 +83,7 @@ impl LoadTrackedBody {
             worker.decrement_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
+        self.load_guard.take();
     }
 }
 
@@ -90,9 +92,17 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
-        if matches!(item, Poll::Ready(None)) {
-            self.release();
-            self.producer_abort.take();
+        match &item {
+            Poll::Ready(Some(Ok(bytes))) if !bytes.is_empty() => {
+                if let Some(guard) = self.load_guard.as_mut() {
+                    guard.prefill_done();
+                }
+            }
+            Poll::Ready(None) => {
+                self.release();
+                self.producer_abort.take();
+            }
+            _ => {}
         }
         item
     }
@@ -128,6 +138,20 @@ fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) ->
         inner: Box::pin(body.into_data_stream()),
         worker: fallback_worker,
         producer_abort,
+        load_guard: None,
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// Keep a policy's load guard until the streamed body ends or is dropped; its first output chunk
+/// marks the prompt prefilled.
+fn hold_guard_until_body_done(response: Response, load_guard: LoadGuard) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = LoadTrackedBody {
+        inner: Box::pin(body.into_data_stream()),
+        worker: None,
+        producer_abort: None,
+        load_guard: Some(load_guard),
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -1418,6 +1442,15 @@ impl Router {
                     } else {
                         worker.decrement_load();
                         RouterMetrics::set_running_requests(worker_url, worker.load());
+                    }
+                }
+            }
+            if let Some(mut guard) = load_guard {
+                if response.status().is_success() {
+                    if is_stream {
+                        response = hold_guard_until_body_done(response, guard);
+                    } else {
+                        guard.prefill_done();
                     }
                 }
             }
@@ -3161,6 +3194,48 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_body_holds_policy_guard_until_done() {
+        use crate::policies::RequestLoadGuard;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counts {
+            prefill_done: AtomicUsize,
+            dropped: AtomicUsize,
+        }
+        struct Guard(Arc<Counts>);
+        impl RequestLoadGuard for Guard {
+            fn prefill_done(&mut self) {
+                self.0.prefill_done.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counts = Arc::new(Counts::default());
+        let response = hold_guard_until_body_done(
+            Response::new(Body::from("data: chunk\n\n")),
+            Box::new(Guard(counts.clone())),
+        );
+        assert_eq!(counts.dropped.load(Ordering::SeqCst), 0);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(counts.prefill_done.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.dropped.load(Ordering::SeqCst), 1);
+
+        let counts = Arc::new(Counts::default());
+        let response = hold_guard_until_body_done(
+            Response::new(Body::from("cancelled")),
+            Box::new(Guard(counts.clone())),
+        );
+        drop(response);
+        assert_eq!(counts.prefill_done.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.dropped.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
