@@ -139,8 +139,9 @@ struct TypedDispatch<'a> {
     is_stream: bool,
     load_incremented: bool,
     prepared: Option<crate::backend::PreparedChat>,
-    // The policy's charge for this request: released by the first response chunk and on drop
-    // (non-streaming: when the body is read; streaming: when the stream ends or is cancelled)
+    // The policy's charge for this request: prefill_done once a successful response returns
+    // output, released on drop (non-streaming: when the body is read; streaming: when the stream
+    // ends or is cancelled)
     load_guard: Option<LoadGuard>,
 }
 
@@ -1533,6 +1534,10 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+        // A failed response prefilled nothing: release the policy's charge now.
+        if !status.is_success() {
+            load_guard = None;
+        }
 
         if !is_stream {
             // For non-streaming requests, preserve headers
@@ -1548,6 +1553,9 @@ impl Router {
                 Ok(body) => {
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
+                    }
+                    if let Some(guard) = load_guard.as_mut() {
+                        guard.prefill_done();
                     }
                     let mut response = Response::new(axum::body::Body::from(body));
                     *response.status_mut() = status;

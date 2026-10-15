@@ -16,10 +16,10 @@
 //! The router does not tokenize: a prompt counts `len(request text) / 4` tokens. The policy asks
 //! for the prompt text (`needs_prompt_text`), so a chat completion hands it the conversation text
 //! that Program scheduling uses. A request of a known session is charged only the growth over
-//! that session's previous prompt. The token charge is released at the first response chunk (the
-//! prefill is done) or when the request ends; the request count when it ends. Only
-//! `select_worker_tracked` charges; `select_worker_with_headers` places the same way without
-//! charging.
+//! that session's last prefilled prompt; a request that fails before any output does not count as
+//! prefilled. The token charge is released when the worker returns output (the prefill is done)
+//! or when the request ends; the request count when it ends. Only `select_worker_tracked`
+//! charges; `select_worker_with_headers` places the same way without charging.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +69,7 @@ struct WorkerLoad {
 #[derive(Debug)]
 struct Session {
     owner: String,
+    /// Tokens of the last prompt the owner prefilled for this session
     prompt_tokens: u64,
     last_seen: Instant,
 }
@@ -283,7 +284,10 @@ impl SessionLeastLoadPolicy {
                     Some((Some(idx), previous)) => {
                         st.counters.owner_hits += 1;
                         if let Some(s) = st.sessions.get_mut(sid) {
-                            s.prompt_tokens = prompt_tokens;
+                            // A tracked request records its prompt once it is prefilled.
+                            if !charge {
+                                s.prompt_tokens = prompt_tokens;
+                            }
                             s.last_seen = now;
                         }
                         // A later turn extends the previous prompt: charge only the growth.
@@ -302,7 +306,7 @@ impl SessionLeastLoadPolicy {
                             sid.to_string(),
                             Session {
                                 owner: workers[idx].url().to_string(),
-                                prompt_tokens,
+                                prompt_tokens: if charge { 0 } else { prompt_tokens },
                                 last_seen: now,
                             },
                         );
@@ -323,6 +327,7 @@ impl SessionLeastLoadPolicy {
                 state: Arc::clone(&self.state),
                 worker_url: url.to_string(),
                 tokens,
+                session_prompt: session.map(|sid| (sid.to_string(), prompt_tokens)),
             }) as LoadGuard)
         } else {
             None
@@ -404,11 +409,13 @@ struct SessionLoadGuard {
     state: Arc<Mutex<State>>,
     worker_url: String,
     tokens: u64,
+    /// (session, prompt tokens) to record on the session once the prompt is prefilled
+    session_prompt: Option<(String, u64)>,
 }
 
 impl RequestLoadGuard for SessionLoadGuard {
     fn prefill_done(&mut self) {
-        if self.tokens == 0 {
+        if self.tokens == 0 && self.session_prompt.is_none() {
             return;
         }
         let mut st = self.state.lock();
@@ -416,6 +423,14 @@ impl RequestLoadGuard for SessionLoadGuard {
             load.tokens = load.tokens.saturating_sub(self.tokens);
         }
         self.tokens = 0;
+        // The owner now caches this prompt: the session's next turn is charged only its growth.
+        if let Some((sid, prompt_tokens)) = self.session_prompt.take() {
+            if let Some(s) = st.sessions.get_mut(&sid) {
+                if s.owner == self.worker_url {
+                    s.prompt_tokens = prompt_tokens;
+                }
+            }
+        }
     }
 }
 
@@ -578,18 +593,37 @@ mod tests {
     fn test_extension_only_token_charge() {
         let workers = dp_workers(2);
         let p = policy(512);
-        let (idx, g1) = route(&p, &workers, Some("s"), 1000);
+        let (idx, mut g1) = route(&p, &workers, Some("s"), 1000);
         assert_eq!(loads(&p, &workers)[idx], (1, 1000));
+        g1.prefill_done();
         drop(g1);
         assert_eq!(loads(&p, &workers)[idx], (0, 0));
         // second turn: 1000 -> 1300 tokens, charged 300
-        let (idx2, g2) = route(&p, &workers, Some("s"), 1300);
+        let (idx2, mut g2) = route(&p, &workers, Some("s"), 1300);
         assert_eq!(idx2, idx);
         assert_eq!(loads(&p, &workers)[idx], (1, 300));
+        g2.prefill_done();
         drop(g2);
         // a shorter prompt (context compaction) is charged nothing
         let (_, _g3) = route(&p, &workers, Some("s"), 200);
         assert_eq!(loads(&p, &workers)[idx], (1, 0));
+    }
+
+    #[test]
+    fn test_failed_request_does_not_record_prompt() {
+        let workers = dp_workers(2);
+        let p = policy(512);
+        // The first try fails before any output: its retry is charged the full prompt again.
+        let (idx, g1) = route(&p, &workers, Some("s"), 1000);
+        drop(g1);
+        let (idx2, mut g2) = route(&p, &workers, Some("s"), 1000);
+        assert_eq!(idx2, idx);
+        assert_eq!(loads(&p, &workers)[idx], (1, 1000));
+        g2.prefill_done();
+        drop(g2);
+        // Prefilled now: the next turn is charged only its growth.
+        let (_, _g3) = route(&p, &workers, Some("s"), 1100);
+        assert_eq!(loads(&p, &workers)[idx], (1, 100));
     }
 
     #[test]

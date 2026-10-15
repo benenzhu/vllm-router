@@ -36,10 +36,11 @@ pub type RequestHeaders = HashMap<String, String>;
 
 /// One request's in-flight load, charged to a worker by `select_worker_tracked`
 ///
-/// The router calls `prefill_done` on every response chunk and drops the guard when the request
-/// ends (finished, failed or aborted by the client); dropping it releases what is left.
+/// The router calls `prefill_done` when a successful response returns output (on every chunk of a
+/// streamed body) and drops the guard when the request ends (finished, failed or aborted by the
+/// client); dropping it releases what is left.
 pub trait RequestLoadGuard: Send {
-    /// A response chunk arrived, so the prompt is prefilled. Must be idempotent.
+    /// The worker returned output, so the prompt is prefilled. Must be idempotent.
     fn prefill_done(&mut self);
 }
 
