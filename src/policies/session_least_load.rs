@@ -49,6 +49,10 @@ pub struct SessionLeastLoadConfig {
     pub req_equiv: u64,
     /// A session unseen for this long is forgotten
     pub session_ttl_secs: u64,
+    /// Charged prompt tokens per priority level for the request's prefill (0 = no priority):
+    /// priority = charged tokens / unit, so short incremental turns go before long cold prefills
+    /// on a server run with `--scheduling-policy priority`
+    pub priority_unit: u64,
 }
 
 impl Default for SessionLeastLoadConfig {
@@ -56,9 +60,13 @@ impl Default for SessionLeastLoadConfig {
         Self {
             req_equiv: 512,
             session_ttl_secs: 4 * 3600,
+            priority_unit: 0,
         }
     }
 }
+
+/// Highest priority value handed out (vLLM's priority is an int)
+const MAX_PRIORITY: u64 = 1_000_000;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct WorkerLoad {
@@ -240,8 +248,8 @@ impl SessionLeastLoadPolicy {
 
     pub fn with_config(config: SessionLeastLoadConfig) -> Self {
         info!(
-            "session_least_load: req_equiv={} session_ttl_secs={}",
-            config.req_equiv, config.session_ttl_secs
+            "session_least_load: req_equiv={} session_ttl_secs={} priority_unit={}",
+            config.req_equiv, config.session_ttl_secs, config.priority_unit
         );
         Self {
             config,
@@ -333,11 +341,14 @@ impl SessionLeastLoadPolicy {
             load.tokens += tokens;
             load.routed += 1;
             RouterMetrics::set_running_requests(url, load.reqs as usize);
+            let priority = (self.config.priority_unit > 0)
+                .then(|| (tokens / self.config.priority_unit).min(MAX_PRIORITY) as i64);
             Some(Box::new(SessionLoadGuard {
                 state: Arc::clone(&self.state),
                 worker_url: url.to_string(),
                 tokens,
                 session_prompt: key.map(|key| (key, prompt_tokens)),
+                priority,
             }) as LoadGuard)
         } else {
             None
@@ -421,9 +432,15 @@ struct SessionLoadGuard {
     tokens: u64,
     /// (session key, prompt tokens) to record on the session once the prompt is prefilled
     session_prompt: Option<(SessionKey, u64)>,
+    /// Prefill priority from the charged tokens (None when priority_unit is 0)
+    priority: Option<i64>,
 }
 
 impl RequestLoadGuard for SessionLoadGuard {
+    fn priority_hint(&self) -> Option<i64> {
+        self.priority
+    }
+
     fn prefill_done(&mut self) {
         if self.tokens == 0 && self.session_prompt.is_none() {
             return;
@@ -488,6 +505,7 @@ mod tests {
         SessionLeastLoadPolicy::with_config(SessionLeastLoadConfig {
             req_equiv,
             session_ttl_secs: 3600,
+            priority_unit: 0,
         })
     }
 
@@ -770,6 +788,7 @@ mod tests {
         let p = SessionLeastLoadPolicy::with_config(SessionLeastLoadConfig {
             req_equiv: 512,
             session_ttl_secs: 0,
+            priority_unit: 0,
         });
         let (_, g) = route(&p, &workers, Some("s"), 10);
         drop(g);
@@ -782,6 +801,27 @@ mod tests {
         let st = p.state.lock();
         assert!(!st.sessions.keys().any(|(_, sid)| sid == "s"));
         assert_eq!(st.counters.new_sessions, 2);
+    }
+
+    #[test]
+    fn test_priority_hint_from_charged_tokens() {
+        let workers = dp_workers(2);
+        let p = SessionLeastLoadPolicy::with_config(SessionLeastLoadConfig {
+            req_equiv: 512,
+            session_ttl_secs: 3600,
+            priority_unit: 250,
+        });
+        // a new session is charged its whole prompt
+        let (_, mut g) = route(&p, &workers, Some("s"), 100_000);
+        assert_eq!(g.priority_hint(), Some(400));
+        g.prefill_done();
+        drop(g);
+        // the next turn is charged only its growth
+        let (_, g2) = route(&p, &workers, Some("s"), 100_600);
+        assert_eq!(g2.priority_hint(), Some(2));
+        // off by default
+        let (_, g3) = route(&policy(512), &workers, Some("t"), 100_000);
+        assert_eq!(g3.priority_hint(), None);
     }
 
     #[test]

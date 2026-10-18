@@ -145,7 +145,7 @@ fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) ->
 
 /// Keep a policy's load guard until the streamed body ends or is dropped; its first output chunk
 /// marks the prompt prefilled.
-fn hold_guard_until_body_done(response: Response, load_guard: LoadGuard) -> Response {
+pub(crate) fn hold_guard_until_body_done(response: Response, load_guard: LoadGuard) -> Response {
     let (parts, body) = response.into_parts();
     let stream = LoadTrackedBody {
         inner: Box::pin(body.into_data_stream()),

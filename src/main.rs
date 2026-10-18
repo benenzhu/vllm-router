@@ -147,11 +147,13 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "session_least_load"])]
     prefill_policy: Option<String>,
 
-    /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Specific policy for decode nodes in PD mode. In vLLM PD discovery mode with
+    /// --intra-node-data-parallel-size > 1 the decode DP rank follows the prefill DP rank,
+    /// except under session_least_load, which places the decode DP rank itself.
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "session_least_load"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -190,6 +192,12 @@ struct CliArgs {
     /// session_least_load: seconds an idle session keeps its owner worker
     #[arg(long, default_value_t = 14400)]
     session_least_load_ttl_secs: u64,
+
+    /// session_least_load in vLLM PD mode: the prefill leg carries vLLM's `priority` =
+    /// charged prompt tokens / this (shortest prefill first on a prefill server run with
+    /// --scheduling-policy priority); 0 sends no priority
+    #[arg(long, default_value_t = 0)]
+    session_least_load_priority_unit: u64,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -427,6 +435,7 @@ impl CliArgs {
             "session_least_load" => PolicyConfig::SessionLeastLoad {
                 req_equiv: self.session_least_load_req_equiv,
                 session_ttl_secs: self.session_least_load_ttl_secs,
+                priority_unit: self.session_least_load_priority_unit,
             },
             _ => PolicyConfig::RoundRobin, // Fallback
         }

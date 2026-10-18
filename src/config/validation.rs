@@ -626,11 +626,12 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
-        // session_least_load charges load only through the regular HTTP router; the PD routers
-        // select without its load guard.
+        // session_least_load charges load through the regular HTTP router and the vLLM PD router's
+        // discovery path; the direct-URL PD path selects without its load guard.
         if let RoutingMode::VllmPrefillDecode {
             prefill_policy,
             decode_policy,
+            discovery_address: None,
             ..
         } = &config.mode
         {
@@ -645,7 +646,8 @@ impl ConfigValidator {
                 .any(|p| matches!(p, PolicyConfig::SessionLeastLoad { .. }))
             {
                 return Err(ConfigError::IncompatibleConfig {
-                    reason: "session_least_load policy requires regular HTTP routing mode"
+                    reason: "session_least_load policy requires regular HTTP routing mode or \
+                             vLLM PD service discovery (--vllm-discovery-address)"
                         .to_string(),
                 });
             }
@@ -1201,6 +1203,7 @@ mod tests {
         let session_least_load = PolicyConfig::SessionLeastLoad {
             req_equiv: 512,
             session_ttl_secs: 14400,
+            priority_unit: 0,
         };
         let pd_mode = |decode_policy: Option<PolicyConfig>| RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
@@ -1224,6 +1227,19 @@ mod tests {
         )));
         assert!(
             ConfigValidator::validate(&RouterConfig::new(pd_mode(None), PolicyConfig::Random))
+                .is_ok()
+        );
+
+        // the discovery path holds the policy's load guard
+        let discovery = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: Some(session_least_load.clone()),
+            decode_policy: Some(session_least_load.clone()),
+            discovery_address: Some("0.0.0.0:36367".to_string()),
+        };
+        assert!(
+            ConfigValidator::validate(&RouterConfig::new(discovery, session_least_load.clone()))
                 .is_ok()
         );
 

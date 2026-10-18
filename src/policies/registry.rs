@@ -209,10 +209,12 @@ impl PolicyRegistry {
             PolicyConfig::SessionLeastLoad {
                 req_equiv,
                 session_ttl_secs,
+                priority_unit,
             } => Arc::new(SessionLeastLoadPolicy::with_config(
                 SessionLeastLoadConfig {
                     req_equiv: *req_equiv,
                     session_ttl_secs: *session_ttl_secs,
+                    priority_unit: *priority_unit,
                 },
             )),
         }

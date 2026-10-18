@@ -6,10 +6,10 @@ use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::config::KvConnector;
-use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{LoadBalancingPolicy, LoadGuard, PolicyRegistry, RequestHeaders};
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -635,6 +636,95 @@ impl VllmPDRouter {
             .collect()
     }
 
+    /// Lowercased request headers for policies that route on them (session ids)
+    fn policy_headers(headers: Option<&HeaderMap>) -> Option<RequestHeaders> {
+        headers.map(|h| {
+            h.iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect()
+        })
+    }
+
+    /// Text a policy routes on: the conversation (chat messages or the prompt) for a policy that
+    /// estimates prompt size from it (session_least_load), the whole request otherwise
+    fn policy_text<'a>(
+        policy: &dyn LoadBalancingPolicy,
+        request_json: &Value,
+        request_str: Option<&'a str>,
+    ) -> Option<Cow<'a, str>> {
+        if policy.needs_prompt_text() {
+            match request_json
+                .get("messages")
+                .or_else(|| request_json.get("prompt"))
+            {
+                Some(Value::String(text)) => return Some(Cow::Owned(text.clone())),
+                Some(other) => return Some(Cow::Owned(other.to_string())),
+                None => {}
+            }
+        }
+        request_str.map(Cow::Borrowed)
+    }
+
+    /// One candidate per DP rank (`host:port@rank`) of every discovered instance, and the
+    /// DP-aware workers a policy selects over (same order)
+    fn dp_rank_candidates(
+        instances: &[(String, String)],
+        dp_size: usize,
+    ) -> (Vec<(String, String)>, Vec<Arc<dyn Worker>>) {
+        let mut candidates = Vec::with_capacity(instances.len() * dp_size);
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::with_capacity(instances.len() * dp_size);
+        for (http_addr, zmq_addr) in instances {
+            let base_url = if http_addr.starts_with("http://") || http_addr.starts_with("https://")
+            {
+                http_addr.clone()
+            } else {
+                format!("http://{}", http_addr)
+            };
+            for rank in 0..dp_size {
+                candidates.push((format!("{}@{}", http_addr, rank), zmq_addr.clone()));
+                workers.push(Arc::new(DPAwareWorker::new(
+                    base_url.clone(),
+                    rank,
+                    dp_size,
+                    WorkerType::Regular,
+                )));
+            }
+        }
+        (candidates, workers)
+    }
+
+    /// Select a (DP rank of a) discovered instance with the request headers, charging the
+    /// policy's load guard. Returns the chosen `(http_address[@rank], zmq_address)`.
+    fn select_dp_rank_tracked(
+        policy: &dyn LoadBalancingPolicy,
+        instances: &[(String, String)],
+        dp_size: usize,
+        request_json: &Value,
+        request_str: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<((String, String), Option<LoadGuard>)> {
+        let (candidates, workers) = Self::dp_rank_candidates(instances, dp_size);
+        let text = Self::policy_text(policy, request_json, request_str);
+        let (idx, guard) = policy.select_worker_tracked(&workers, text.as_deref(), headers)?;
+        Some((candidates[idx].clone(), guard))
+    }
+
+    /// Keep the decode policy's load guard until the decode body ends (its first output chunk
+    /// marks the decode leg's prompt done); a failed response releases it at once.
+    fn hold_decode_guard(response: Response, guard: Option<LoadGuard>) -> Response {
+        match guard {
+            Some(guard) if response.status().is_success() => {
+                super::router::hold_guard_until_body_done(response, guard)
+            }
+            _ => response,
+        }
+    }
+
     /// Select worker using policy-based load balancing
     fn select_worker_with_policy(
         &self,
@@ -699,35 +789,84 @@ impl VllmPDRouter {
         // Use policy-based load balancing to select prefill and decode workers
         let request_text = serde_json::to_string(&request_json).ok();
         let request_str = request_text.as_deref();
+        let dp_size = self.intra_node_data_parallel_size;
+        let policy_headers = Self::policy_headers(headers);
+        // A client may pin the DP ranks (per-rank probes): X-data-parallel-rank pins the prefill
+        // leg, X-Decode-Data-Parallel-Rank the decode leg (default: as without a pin)
+        let pinned_rank = |name: &str| {
+            policy_headers
+                .as_ref()
+                .and_then(|h| h.get(name))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&rank| dp_size > 1 && rank < dp_size)
+        };
+        let pin = |instance: &(String, String), rank: usize| {
+            (format!("{}@{}", instance.0, rank), instance.1.clone())
+        };
+        let pinned_prefill = pinned_rank("x-data-parallel-rank");
+        let pinned_decode = pinned_rank("x-decode-data-parallel-rank");
 
-        let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
-                Some(idx) => idx,
-                None => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Prefill policy failed to select a worker".to_string(),
-                    )
-                        .into_response();
-                }
-            };
-
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
-            Some(idx) => idx,
-            None => {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
-                )
-                    .into_response();
-            }
+        // With --intra-node-data-parallel-size > 1 the prefill policy places the request on a DP
+        // rank (one candidate per rank, with the request headers, so session-keyed policies keep
+        // a conversation on its rank's prefix cache) and holds its load guard until the prefill
+        // leg returns.
+        let prefill_choice = if let Some(rank) = pinned_prefill {
+            self.select_worker_with_policy(&prefill_instances, true, request_str)
+                .map(|idx| (pin(&prefill_instances[idx], rank), None))
+        } else if dp_size > 1 {
+            Self::select_dp_rank_tracked(
+                self.policy_registry.get_prefill_policy().as_ref(),
+                &prefill_instances,
+                dp_size,
+                &request_json,
+                request_str,
+                policy_headers.as_ref(),
+            )
+        } else {
+            self.select_worker_with_policy(&prefill_instances, true, request_str)
+                .map(|idx| (prefill_instances[idx].clone(), None))
+        };
+        let Some((prefill_instance, prefill_guard)) = prefill_choice else {
+            RouterMetrics::record_pd_error("server_selection");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Prefill policy failed to select a worker".to_string(),
+            )
+                .into_response();
         };
 
-        let (prefill_http, prefill_zmq) = &prefill_instances[prefill_idx];
-        let (decode_http, decode_zmq) = &decode_instances[decode_idx];
+        // The decode DP rank follows the prefill DP rank, unless the decode policy places DP
+        // ranks itself (session_least_load: a session stays on its decode rank, a new session
+        // takes the least-loaded one). The decode leg still reads the KV from the prefill rank:
+        // READ mode forwards the prefill response's remote_dp_rank, WRITE mode pins it.
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let decode_choice = if let Some(rank) = pinned_decode {
+            self.select_worker_with_policy(&decode_instances, false, request_str)
+                .map(|idx| (pin(&decode_instances[idx], rank), None))
+        } else if dp_size > 1 && decode_policy.name() == "session_least_load" {
+            Self::select_dp_rank_tracked(
+                decode_policy.as_ref(),
+                &decode_instances,
+                dp_size,
+                &request_json,
+                request_str,
+                policy_headers.as_ref(),
+            )
+        } else {
+            self.select_worker_with_policy(&decode_instances, false, request_str)
+                .map(|idx| (decode_instances[idx].clone(), None))
+        };
+        let Some((decode_instance, decode_guard)) = decode_choice else {
+            RouterMetrics::record_pd_error("server_selection");
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Decode policy failed to select a worker".to_string(),
+            )
+                .into_response();
+        };
+
+        let (prefill_http, prefill_zmq) = &prefill_instance;
+        let (decode_http, decode_zmq) = &decode_instance;
 
         let prefill_policy_name = self.policy_registry.get_prefill_policy().name();
         let decode_policy_name = self.policy_registry.get_decode_policy().name();
@@ -746,10 +885,12 @@ impl VllmPDRouter {
         match self
             .process_vllm_two_stage_request_discovered(
                 request_json,
-                &prefill_instances[prefill_idx],
-                &decode_instances[decode_idx],
+                &prefill_instance,
+                &decode_instance,
                 path,
                 headers,
+                prefill_guard,
+                decode_guard,
             )
             .await
         {
@@ -876,6 +1017,7 @@ impl VllmPDRouter {
     }
 
     /// Two-stage request processing for vLLM disaggregated mode using discovered endpoints
+    #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request_discovered(
         &self,
         request_json: Value,
@@ -883,6 +1025,8 @@ impl VllmPDRouter {
         decode_instance: &(String, String),
         path: &str,
         headers: Option<&HeaderMap>,
+        mut prefill_guard: Option<LoadGuard>,
+        decode_guard: Option<LoadGuard>,
     ) -> Result<Response, String> {
         let (prefill_http, prefill_zmq) = prefill_instance;
         let (decode_http, decode_zmq) = decode_instance;
@@ -905,6 +1049,11 @@ impl VllmPDRouter {
 
         // Prepare prefill request (max_tokens=1 to force prefill-only mode)
         let mut prefill_request = Self::prepare_prefill_request(request_json.clone(), path);
+        // A policy that sizes the prompt work may rank the prefill (vLLM `priority`, lower first):
+        // the prefill leg only, the decode server may not run priority scheduling.
+        if let Some(priority) = prefill_guard.as_ref().and_then(|g| g.priority_hint()) {
+            prefill_request["priority"] = json!(priority);
+        }
 
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
@@ -917,12 +1066,19 @@ impl VllmPDRouter {
                 % self.intra_node_data_parallel_size;
             prefill_dp_rank = Some(rank);
         }
+        // The decode leg's own DP rank: placed by the decode policy, else the prefill rank.
+        let effective_decode_dp_rank =
+            if decode_dp_rank.is_none() && self.intra_node_data_parallel_size > 1 {
+                prefill_dp_rank
+            } else {
+                decode_dp_rank
+            };
 
         // Add kv_transfer_params for KV connector support at top level
         prefill_request["kv_transfer_params"] = self.build_prefill_kv_transfer_params(
             transfer_id.as_deref(),
             Some(&decode_base_http),
-            prefill_dp_rank,
+            effective_decode_dp_rank,
         )?;
 
         debug!(
@@ -1034,6 +1190,11 @@ impl VllmPDRouter {
             self.stop_profiling(&format!("http://{}", prefill_base_http))
                 .await;
 
+            // The prefill leg is done: release its charge on the prefill rank.
+            if let Some(mut guard) = prefill_guard.take() {
+                guard.prefill_done();
+            }
+
             Some(prefill_json)
         };
 
@@ -1075,12 +1236,6 @@ impl VllmPDRouter {
             .header("Content-Type", "application/json")
             .header("X-Request-Id", &request_id); // Same P2P coordination metadata in header
 
-        let effective_decode_dp_rank =
-            if decode_dp_rank.is_none() && self.intra_node_data_parallel_size > 1 {
-                prefill_dp_rank
-            } else {
-                decode_dp_rank
-            };
         decode_request_builder =
             dp_utils::add_dp_rank_header(decode_request_builder, effective_decode_dp_rank);
         if let Some(rank) = effective_decode_dp_rank {
@@ -1176,6 +1331,11 @@ impl VllmPDRouter {
                 },
             );
             let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
+            if let Some(mut guard) = prefill_guard.take() {
+                if prefill_result.is_ok() {
+                    guard.prefill_done();
+                }
+            }
             let concurrent_prefill_response_json: Option<Value> = match prefill_result {
                 Err(prefill_err) => {
                     self.stop_profiling(&format!("http://{}", decode_base_http))
@@ -1228,7 +1388,8 @@ impl VllmPDRouter {
                     is_streaming,
                     needs_logprobs,
                 )
-                .await;
+                .await
+                .map(|response| Self::hold_decode_guard(response, decode_guard));
         }
 
         let decode_response = match otel_http::send_client_request(
@@ -1270,6 +1431,7 @@ impl VllmPDRouter {
             needs_logprobs,
         )
         .await
+        .map(|response| Self::hold_decode_guard(response, decode_guard))
     }
 
     /// Two-stage request processing for vLLM disaggregated mode

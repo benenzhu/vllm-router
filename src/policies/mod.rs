@@ -42,6 +42,12 @@ pub type RequestHeaders = HashMap<String, String>;
 pub trait RequestLoadGuard: Send {
     /// The worker returned output, so the prompt is prefilled. Must be idempotent.
     fn prefill_done(&mut self);
+
+    /// Scheduling priority for this request's prefill (vLLM `priority`, lower runs first), if the
+    /// policy derives one from the prompt work it charged. Default: none.
+    fn priority_hint(&self) -> Option<i64> {
+        None
+    }
 }
 
 pub type LoadGuard = Box<dyn RequestLoadGuard>;

@@ -695,6 +695,9 @@ pub enum PolicyConfig {
         req_equiv: u64,
         /// Seconds an idle session keeps its owner
         session_ttl_secs: u64,
+        /// Charged prompt tokens per prefill priority level in vLLM PD mode (0 = no priority)
+        #[serde(default)]
+        priority_unit: u64,
     },
 }
 
